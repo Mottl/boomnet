@@ -152,8 +152,7 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
     where
         F: FnOnce(&mut Headers),
     {
-        self.try_new_request_with_headers(method, path, body, builder)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "no available connection in the pool"))
+        self.try_new_request_with_headers(method, path, body, builder)
     }
 
     /// Prepare a request with no additional headers and optional body.
@@ -187,12 +186,13 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
 
     /// Try to prepare a request with custom headers and optional body.
     ///
-    /// Returns `Ok(None)` if the pool is unable to allocate a connection. In that case, no request is
-    /// prepared and `builder` is not called.
+    /// Returns `Err(std::io::Error)` with `ErrorKind::ResourceBusy` if the pool is unable
+    /// to allocate a connection. In that case, no request is prepared.
     ///
     /// # Examples
     ///
     /// ```no_run
+    /// use std::io::ErrorKind;
     /// use http::Method;
     /// use boomnet::http::{ConnectionPool, SingleTlsConnectionPool};
     /// use boomnet::stream::ConnectionInfo;
@@ -206,12 +206,14 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
     ///     |hdrs| {
     ///         hdrs["X-Custom"] = "Value";
     ///     },
-    /// ).unwrap() {
-    ///     Some(request) => {
+    /// ) {
+    ///     Ok(request) => {
     ///         let response = request.block().unwrap();
     ///     }
-    ///     None => {
+    ///     Err(err) if err.kind() == ErrorKind::ResourceBusy => {
     ///         // Try again after a connection becomes available.
+    ///     }
+    ///     Err(err) => {
     ///     }
     /// }
     /// ```
@@ -222,41 +224,40 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
         path: impl AsRef<str>,
         body: Option<&[u8]>,
         builder: F,
-    ) -> io::Result<Option<HttpRequest<C, CHUNK_SIZE>>>
+    ) -> io::Result<HttpRequest<C, CHUNK_SIZE>>
     where
         F: FnOnce(&mut Headers),
     {
-        let Some(conn) = self.connection_pool.borrow_mut().acquire()? else {
-            return Ok(None);
-        };
-
+        let conn = self.connection_pool.borrow_mut().acquire()?;
         builder(self.headers.clear());
 
         let request = HttpRequest::new(method, path, body, &self.headers, conn, self.connection_pool.clone())?;
-
-        Ok(Some(request))
+        Ok(request)
     }
 
     /// Try to prepare a request with no additional headers and optional body.
     ///
-    /// Returns `Ok(None)` if the pool is unable to allocate a connection. In that case, no request is
-    /// prepared.
+    /// Returns `Err(std::io::Error)` with `ErrorKind::ResourceBusy` if the pool is unable
+    /// to allocate a connection. In that case, no request is prepared.
     ///
     /// # Examples
     ///
     /// ```no_run
+    /// use std::io::ErrorKind;
     /// use http::Method;
     /// use boomnet::http::{ConnectionPool, SingleTlsConnectionPool};
     /// use boomnet::stream::ConnectionInfo;
     ///
     /// let mut client = SingleTlsConnectionPool::new(ConnectionInfo::new("example.com", 443)).into_http_client();
     ///
-    /// match client.try_new_request(Method::GET, "/", None).unwrap() {
-    ///     Some(request) => {
+    /// match client.try_new_request(Method::GET, "/", None) {
+    ///     Ok(request) => {
     ///         let response = request.block().unwrap();
     ///     }
-    ///     None => {
+    ///     Err(err) if err.kind() == ErrorKind::ResourceBusy => {
     ///         // Try again after a connection becomes available.
+    ///     }
+    ///     Err(err) => {
     ///     }
     /// }
     /// ```
@@ -266,7 +267,7 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> HttpClient<C, CHUNK
         method: Method,
         path: impl AsRef<str>,
         body: Option<&[u8]>,
-    ) -> io::Result<Option<HttpRequest<C, CHUNK_SIZE>>> {
+    ) -> io::Result<HttpRequest<C, CHUNK_SIZE>> {
         self.try_new_request_with_headers(method, path, body, |_| {})
     }
 }
@@ -288,10 +289,10 @@ pub trait ConnectionPool<const CHUNK_SIZE: usize = DEFAULT_CHUNK_SIZE>: Sized {
     fn host(&self) -> &str;
 
     /// Acquire next free connection, if available.
-    fn acquire(&mut self) -> io::Result<Option<Connection<Self::Stream, CHUNK_SIZE>>>;
+    fn acquire(&mut self) -> io::Result<Connection<Self::Stream, CHUNK_SIZE>>;
 
     /// Release a connection back into the pool.
-    fn release(&mut self, stream: Option<Connection<Self::Stream, CHUNK_SIZE>>);
+    fn release(&mut self, stream: Connection<Self::Stream, CHUNK_SIZE>);
 }
 
 /// A single-connection pool over TLS, reconnecting on demand.
@@ -319,7 +320,7 @@ impl ConnectionPool for SingleTlsConnectionPool {
         self.connection_info.host()
     }
 
-    fn acquire(&mut self) -> io::Result<Option<Connection<Self::Stream>>> {
+    fn acquire(&mut self) -> io::Result<Connection<Self::Stream>> {
         match (self.conn.take(), self.has_active_connection) {
             (Some(_), true) => {
                 // we can at most have one active connection
@@ -327,9 +328,9 @@ impl ConnectionPool for SingleTlsConnectionPool {
             }
             (Some(stream), false) => {
                 self.has_active_connection = true;
-                Ok(Some(stream))
+                Ok(stream)
             }
-            (None, true) => Ok(None),
+            (None, true) => Err(io::Error::new(ErrorKind::ResourceBusy, "no available connection in the pool")),
             (None, false) => {
                 let stream = self
                     .connection_info
@@ -338,17 +339,15 @@ impl ConnectionPool for SingleTlsConnectionPool {
                     .into_tls_stream_with_config(|tls_cfg| tls_cfg.with_no_cert_verification())?
                     .into_default_buffered_stream();
                 self.has_active_connection = true;
-                Ok(Some(Connection::new(stream)))
+                Ok(Connection::new(stream))
             }
         }
     }
 
-    fn release(&mut self, conn: Option<Connection<Self::Stream>>) {
+    fn release(&mut self, conn: Connection<Self::Stream>) {
         self.has_active_connection = false;
-        if let Some(conn) = conn {
-            if !conn.disconnected {
-                let _ = self.conn.insert(conn);
-            }
+        if !conn.disconnected {
+            self.conn.replace(conn);
         }
     }
 }
@@ -549,7 +548,9 @@ impl<C: ConnectionPool<CHUNK_SIZE>, const CHUNK_SIZE: usize> Drop for HttpReques
         if let Some(conn) = self.conn.as_mut() {
             conn.buffer.clear();
         }
-        self.pool.borrow_mut().release(self.conn.take());
+        if let Some(conn) = self.conn.take() {
+            self.pool.borrow_mut().release(conn);
+        }
     }
 }
 
